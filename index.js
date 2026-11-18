@@ -1,6 +1,6 @@
 /*
  * TT DeepSeek Search - frontend SillyTavern / TauriTavern extension.
- * DeepSeek search and optional automatic routing for the current chat turn.
+ * DeepSeek search, webpage reading, and optional routing for the current chat turn.
  * For personal use. Do not ship API keys inside this script.
  */
 import { eventSource, event_types, setExtensionPrompt, extension_prompt_types, saveSettingsDebounced } from '../../../../script.js';
@@ -124,6 +124,43 @@ function extractQuery(message) {
     const firstLine = text.match(/^\s*联网搜索\s*[:：]\s*([^\r\n]+)/);
     if (firstLine) return validateQuery(firstLine[1]);
     return null;
+}
+
+function parsePageURL(raw) {
+    let parsed;
+    try { parsed = new URL(String(raw || '')); }
+    catch { return null; }
+    if (!['https:', 'http:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password) return null;
+    parsed.hash = '';
+    return parsed.href.length <= 8192 ? parsed : null;
+}
+
+function extractReadRequest(message) {
+    const marker = /\[\[(?:读|read|fetch)\s*[:：][ \t]*([^\r\n]*?)\]\]/gi;
+    const marked = [...message.matchAll(marker)];
+    const links = marked.map(match => match[1].trim());
+    let question;
+    if (links.length) {
+        question = message.replace(marker, ' ').trim();
+    } else {
+        const otherLines = [];
+        for (const line of message.split(/\r?\n/)) {
+            const words = line.trim().split(/\s+/).map(word => word.replace(/^<(https?:\/\/.*)>$/i, '$1'));
+            if (words.every(word => /^https?:\/\/\S*$/i.test(word))) links.push(...words);
+            else otherLines.push(line);
+        }
+        question = otherLines.join('\n').trim();
+    }
+    if (!links.length) return null;
+
+    const urls = new Set();
+    for (const link of links) {
+        const parsed = parsePageURL(link);
+        if (!parsed || /\s/.test(link)) throw new Error('直读链接需要有效且不含账号密码的 HTTP(S) 地址，最多 8,192 字符。');
+        urls.add(parsed.href);
+    }
+    if (urls.size > MAX_PAGES_PER_SEARCH) throw new Error(`一次最多直读 ${MAX_PAGES_PER_SEARCH} 个链接，请分开发送。`);
+    return { urls: [...urls], question };
 }
 
 function latestUserIndex(chat) {
@@ -435,13 +472,9 @@ function sourcesForAnalysis(collected, cfg, question, feedback, queries) {
 function collectSources(collected, records) {
     const candidates = new Set();
     for (const record of records.slice(0, 10)) {
-        let parsed;
-        try { parsed = new URL(String(record?.url || '')); }
-        catch { continue; }
-        if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) continue;
-        parsed.hash = '';
+        const parsed = parsePageURL(record?.url);
+        if (!parsed) continue;
         const url = parsed.href;
-        if (url.length > 8192) continue;
         if (!collected.has(url)) {
             collected.set(url, {
                 id: collected.size + 1, url, host: parsed.hostname,
@@ -546,12 +579,11 @@ function resetActivity() {
     showActivity('暂无联网记录', { detail: '发送消息后查看本轮联网情况。' });
 }
 
-async function prepareSearch(userMessage, cfg, signal, { history, feedback, previous }) {
+async function prepareResearch(userMessage, cfg, signal, { history, feedback, previous }) {
     if (!userMessage.trim()) {
         showActivity('暂无联网记录');
         return;
     }
-    const question = compact(userMessage, 950);
     const dialogue = history.length ? { history } : {};
     const collected = new Map();
     const queries = [];
@@ -561,18 +593,54 @@ async function prepareSearch(userMessage, cfg, signal, { history, feedback, prev
     let pageError = '';
     let legacyLimit = false;
     let issue = '';
+    let reading;
+
+    async function readPages(candidates, progress) {
+        if (!candidates.length) return;
+        showActivity(`读取 ${candidates.length} 篇网页`, progress);
+        const pages = await Promise.allSettled(candidates.map(source => {
+            source.attempted = true;
+            return requestPage(source.url, cfg, signal);
+        }));
+        if (signal.aborted) return;
+        for (const [index, page] of pages.entries()) {
+            if (page.status === 'fulfilled') {
+                const source = candidates[index];
+                source.content = page.value.content;
+                legacyLimit ||= page.value.legacyLimit;
+                if (page.value.title) source.title = page.value.title;
+            } else if (!pageError) {
+                pageError = compact(page.reason?.message || page.reason, 240);
+            }
+        }
+    }
+
     try {
         let initialQuery;
         try { initialQuery = extractQuery(userMessage); }
         catch (err) { if (!feedback) throw err; }
+        reading = initialQuery ? null : extractReadRequest(userMessage);
+        const question = compact(reading ? reading.question || '请阅读用户指定的网页并整理主要内容。' : userMessage, 950);
         const analyze = () => analyzeResearch({
             question, initial_query: initialQuery || '', feedback, previous, ...dialogue,
-            queries, remaining_searches: MAX_SEARCHES - queries.length,
+            queries, remaining_searches: reading ? 0 : MAX_SEARCHES - queries.length,
             sources: sourcesForAnalysis(collected, cfg, question, feedback, queries),
         }, cfg, signal);
 
         let query;
-        if (feedback) {
+        if (reading) {
+            decision = '直接读取指定链接';
+            const progress = { decision, feedback, kind: 'pending' };
+            const candidates = collectSources(collected, reading.urls.map(url => ({ url })));
+            await readPages(candidates, progress);
+            if (signal.aborted) return;
+            if (candidates.some(source => source.content)) {
+                if (pageError) issue = `部分链接读取失败。${pageError}`;
+                showActivity('分析网页正文', progress);
+                analysis = await analyze();
+                if (signal.aborted) return;
+            }
+        } else if (feedback) {
             decision = '根据反馈重新研究';
             showActivity('正在规划重搜', { decision, feedback, kind: 'pending' });
             const plan = await analyze();
@@ -595,7 +663,7 @@ async function prepareSearch(userMessage, cfg, signal, { history, feedback, prev
             }
             query = result.query;
         } else {
-            showActivity('未触发搜索', { detail: '手动模式使用 [[搜:关键词]] 发起搜索。' });
+            showActivity('未触发联网', { detail: '用 [[搜:关键词]] 发起搜索，或单独发送网址以读取网页。' });
             return;
         }
 
@@ -615,24 +683,8 @@ async function prepareSearch(userMessage, cfg, signal, { history, feedback, prev
             const results = await getResults(effectiveQuery, cfg, signal, Boolean(feedback));
             if (signal.aborted) return;
             const candidates = collectSources(collected, results).slice(0, MAX_PAGES_PER_SEARCH);
-            if (candidates.length) {
-                showActivity(`读取 ${candidates.length} 篇网页`, progress);
-                const pages = await Promise.allSettled(candidates.map(source => {
-                    source.attempted = true;
-                    return requestPage(source.url, cfg, signal);
-                }));
-                if (signal.aborted) return;
-                for (const [index, page] of pages.entries()) {
-                    if (page.status === 'fulfilled') {
-                        const source = candidates[index];
-                        source.content = page.value.content;
-                        legacyLimit ||= page.value.legacyLimit;
-                        if (page.value.title) source.title = page.value.title;
-                    } else if (!pageError) {
-                        pageError = compact(page.reason?.message, 240);
-                    }
-                }
-            }
+            await readPages(candidates, progress);
+            if (signal.aborted) return;
             showActivity(`分析第 ${round} 轮资料`, progress);
             analysis = await analyze();
             if (signal.aborted) return;
@@ -645,7 +697,7 @@ async function prepareSearch(userMessage, cfg, signal, { history, feedback, prev
         issue = `研究中断。${compact(err?.message || err, 280)}`;
     }
     if (legacyLimit) issue = [issue, '当前 Worker 可能已截断长正文。重新部署新版 Worker 可使用新的正文上限。'].filter(Boolean).join('\n');
-    return formatResearch({ collected, analysis, decision, reason, queries, feedback, issue });
+    return { ...formatResearch({ collected, analysis, decision, reason, queries, feedback, issue }), directRead: Boolean(reading) };
 }
 
 // The host awaits this hook before sending the chat generation request.
@@ -670,9 +722,9 @@ globalThis.ttDeepSeekSearchInterceptor = async function (chat, _contextSize, abo
         let feedback = '';
         let previous = '';
         while (!signal.aborted) {
-            const outcome = await prepareSearch(userMessage, cfg, signal, { history, feedback, previous });
+            const outcome = await prepareResearch(userMessage, cfg, signal, { history, feedback, previous });
             if (!outcome || signal.aborted) return;
-            const { label, prompt, draft, ...details } = outcome;
+            const { label, prompt, draft, directRead, ...details } = outcome;
             if (!requiresReview) {
                 injectPrompt(prompt);
                 showActivity(label, details);
@@ -680,7 +732,7 @@ globalThis.ttDeepSeekSearchInterceptor = async function (chat, _contextSize, abo
             }
 
             showActivity('等待确认', { ...details, detail: label, kind: 'pending' });
-            const { action, comment } = await waitForReview(signal);
+            const { action, comment } = await waitForReview(signal, directRead);
             if (signal.aborted) return;
             if (action === 'revise') {
                 feedback = [feedback, comment].filter(Boolean).join('\n').slice(-3 * MAX_FEEDBACK_CHARS);
@@ -750,7 +802,7 @@ function showActivity(label, { decision = '', reason = '', query = '', feedback 
     list.replaceChildren(...sources.map(createSource));
 }
 
-async function waitForReview(signal) {
+async function waitForReview(signal, directRead) {
     if (signal.aborted) return { action: 'cancelled' };
     const activity = document.getElementById('ttds_activity');
     const review = activity?.querySelector('.ttds-activity-review');
@@ -781,6 +833,8 @@ async function waitForReview(signal) {
         }
 
         input.value = '';
+        input.placeholder = directRead ? '例如，重点提取网页中关于版本变更的信息' : '例如，只查官方文档并核实版本号';
+        revise.textContent = directRead ? '按意见重新读取' : '按意见重搜';
         revise.disabled = true;
         approve.addEventListener('click', accept);
         decline.addEventListener('click', reject);
@@ -811,7 +865,7 @@ function mountActivity(fallback) {
   </div>
   <div class="ttds-activity-review" role="group" aria-label="联网结果确认" hidden>
     <label for="ttds_research_feedback">补充要求或修改意见</label>
-    <textarea class="text_pole" id="ttds_research_feedback" rows="2" maxlength="${MAX_FEEDBACK_CHARS}" placeholder="例如，只查官方文档并核实版本号"></textarea>
+    <textarea class="text_pole" id="ttds_research_feedback" rows="2" maxlength="${MAX_FEEDBACK_CHARS}"></textarea>
     <div class="ttds-review-actions">
       <button class="menu_button" id="ttds_decline_results" type="button">拒绝并结束</button>
       <button class="menu_button" id="ttds_revise_results" type="button" disabled>按意见重搜</button>
@@ -871,7 +925,8 @@ function createUI() {
     <p class="ttds-help">长网页优先保留与问题有关的段落。每次分析合计最多 ${MAX_ANALYSIS_CHARS.toLocaleString()} 字符。</p>
     <label for="ttds_timeout">搜索和读取超时秒数（5～60）</label><input id="ttds_timeout" class="text_pole" type="number" min="5" max="60" />
     <div class="ttds-actions"><button class="menu_button" id="ttds_test" type="button">测试搜索和读取</button><button class="menu_button" id="ttds_test_router" type="button">测试搜索规划</button><button class="menu_button" id="ttds_clear" type="button">清除密钥和中继口令</button></div>
-    <p class="ttds-help">每次研究最多搜索 ${MAX_SEARCHES} 次，每次读取最多 ${MAX_PAGES_PER_SEARCH} 篇网页。任一模式都可以用 <code>[[搜:关键词]]</code> 指定首轮搜索词。</p>
+    <p class="ttds-help">用 <code>[[搜:关键词]]</code> 指定首轮搜索词。要直接读取网页，请单独发送网址，或在消息中用 <code>[[读:网址]]</code> 指定。网址单独成行时可以在其他行补充问题。</p>
+    <p class="ttds-help">每次研究最多搜索 ${MAX_SEARCHES} 次，每次读取最多 ${MAX_PAGES_PER_SEARCH} 篇网页。</p>
     <div id="ttds_status" class="ttds-status" aria-live="polite" hidden></div>
   </div>
 </section>`;
