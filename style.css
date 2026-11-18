@@ -1,0 +1,12 @@
+.ttds-panel { margin-bottom: 12px; }
+.ttds-panel .inline-drawer-content { padding: 10px 12px; }
+.ttds-panel label { display: block; margin-top: 9px; font-size: .94em; }
+.ttds-panel input.text_pole, .ttds-panel select.text_pole { width: 100%; min-height: 36px; box-sizing: border-box; margin-top: 4px; }
+.ttds-panel .checkbox_label { display: flex; align-items: center; gap: 7px; }
+.ttds-panel .ttds-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.ttds-panel .ttds-actions button { min-height: 38px; }
+.ttds-panel .ttds-help { margin: 10px 0 4px; line-height: 1.65; font-size: .9em; opacity: .84; }
+.ttds-panel .ttds-help code { font-size: .9em; user-select: all; overflow-wrap: anywhere; }
+.ttds-panel .ttds-status { margin-top: 10px; padding: 9px 11px; border: 1px solid var(--SmartThemeBorderColor, #999); border-radius: 8px; overflow-wrap: anywhere; font-size: .9em; }
+.ttds-panel .ttds-status[data-kind="ok"] { border-color: #6b9f83; }
+.ttds-panel .ttds-status[data-kind="error"] { border-color: #ca7070; }
