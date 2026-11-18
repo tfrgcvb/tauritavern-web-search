@@ -5,6 +5,6 @@
   "css": "style.css",
   "generate_interceptor": "ttDeepSeekSearchInterceptor",
   "author": "Community example (generated with ChatGPT)",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "auto_update": false
 }
