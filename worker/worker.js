@@ -1,11 +1,13 @@
 /**
  * Optional Cloudflare Worker for TT DeepSeek AutoSearch.
  * Secrets: DEEPSEEK_API_KEY, TT_RELAY_TOKEN
- * Routes: POST /decide, /search, /fetch and /analyze.
+ * Routes: POST /chat, /decide, /search, /fetch and /analyze.
  */
 const SEARCH_API = 'https://api.deepseek.com/v1/tools/search';
 const FETCH_API = 'https://api.deepseek.com/v1/tools/fetch';
 const CHAT_API = 'https://api.deepseek.com/chat/completions';
+const MESSAGES_API = 'https://api.deepseek.com/anthropic/v1/messages';
+const MAX_CHAT_BODY_CHARS = 2_000_000;
 const MAX_PAGE_CHARS = 32000;
 const MAX_ANALYSIS_CHARS = 120000;
 const MAX_ANALYSIS_BODY_CHARS = 1000000;
@@ -86,6 +88,46 @@ async function maxThinking(instruction, message, token, signal) {
     catch { throw new Error('DeepSeek 未返回有效的研究 JSON。'); }
 }
 
+async function streamChat(data, token, signal) {
+    const messages = data?.messages;
+    if (!Array.isArray(messages) || !messages.length || messages.length % 2 === 0
+        || messages.some((message, index) => index % 2 === 0
+            ? message?.role !== 'user' || typeof message.content !== 'string' || !message.content.trim()
+            : message?.role !== 'assistant' || !Array.isArray(message.content) || !message.content.length)) {
+        return reply({ error: { message: 'DeepSeek 对话需要有效的用户和助手消息。' } }, 400);
+    }
+    if (typeof data.system !== 'string' || data.system.length > 32000) {
+        return reply({ error: { message: 'DeepSeek 对话的系统提示无效。' } }, 400);
+    }
+    const thinking = data.thinking?.type !== 'disabled';
+    const tools = [{ type: 'deepseek_read_url', name: 'deepseek_read_url' }];
+    if (Array.isArray(data.tools) && data.tools.some(tool => tool?.type === 'deepseek_web_search')) {
+        tools.push({ type: 'deepseek_web_search', name: 'deepseek_web_search' });
+    }
+    const response = await fetch(MESSAGES_API, {
+        method: 'POST',
+        headers: { 'x-api-key': token, 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+        body: JSON.stringify({
+            model: 'deepseek-flash', messages, system: data.system, stream: true, tools,
+            thinking: { type: thinking ? 'enabled' : 'disabled' },
+            ...(thinking ? { output_config: { effort: 'max' } } : {}),
+        }),
+        signal,
+    });
+    const contentType = response.headers.get('Content-Type') ?? '';
+    if (!response.ok) {
+        let error;
+        try { error = (await response.json())?.error; } catch { /* Use the status below. */ }
+        const message = String(error?.message || `DeepSeek HTTP ${response.status}`).replaceAll(token, '[已隐藏]');
+        return reply({ error: { message: message.slice(0, 250) } }, response.status);
+    }
+    if (!response.body || !contentType.toLowerCase().includes('text/event-stream')) {
+        void response.body?.cancel().catch(() => {});
+        return reply({ error: { message: 'DeepSeek 未返回流式对话。' } }, 502);
+    }
+    return new Response(response.body, { headers: { ...CORS, 'Content-Type': contentType } });
+}
+
 function boundedHistory(input) {
     if (!Array.isArray(input)) return [];
     const history = [];
@@ -139,19 +181,20 @@ export default {
     async fetch(request, env) {
         if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
         const path = new URL(request.url).pathname;
-        if (!['/search', '/fetch', '/decide', '/analyze'].includes(path)) return reply({ error: { message: '研究接口不存在。' } }, 404);
+        if (!['/search', '/fetch', '/decide', '/analyze', '/chat'].includes(path)) return reply({ error: { message: '研究接口不存在。' } }, 404);
         if (request.method !== 'POST') return reply({ error: { message: '只允许 POST' } }, 405);
         if (!env?.DEEPSEEK_API_KEY || !env?.TT_RELAY_TOKEN) return reply({ error: { message: '缺少 Worker Secret 配置。' } }, 503);
         if (request.headers.get('Authorization') !== `Bearer ${env.TT_RELAY_TOKEN}`) return reply({ error: { message: '访问口令无效。' } }, 401);
         try {
             const bodyText = await request.text();
-            const bodyLimit = { '/analyze': MAX_ANALYSIS_BODY_CHARS, '/decide': MAX_DECIDE_BODY_CHARS, '/fetch': 9000 }[path] ?? 3000;
+            const bodyLimit = { '/chat': MAX_CHAT_BODY_CHARS, '/analyze': MAX_ANALYSIS_BODY_CHARS, '/decide': MAX_DECIDE_BODY_CHARS, '/fetch': 9000 }[path] ?? 3000;
             if (bodyText.length > bodyLimit) return reply({ error: { message: '请求体过大。' } }, 413);
             let data;
             try { data = JSON.parse(bodyText); }
             catch { return reply({ error: { message: '请求体必须是有效 JSON。' } }, 400); }
             const token = env.DEEPSEEK_API_KEY;
             const signal = request.signal;
+            if (path === '/chat') return await streamChat(data, token, signal);
             if (path === '/decide') {
                 const message = String(data?.message || '').trim().slice(0, 950);
                 if (!message) return reply({ need_search: false, query: '', reasoning_effort: 'max', history_supported: true });

@@ -133,3 +133,28 @@
     white-space: normal;
 }
 #ttds_approve_results { border-color: var(--SmartThemeQuoteColor, #7498bf); }
+
+.ttds-chat-composer {
+    display: grid;
+    gap: 4px;
+    margin-block: 4px;
+}
+.ttds-chat-composer[hidden], .ttds-chat-composer [hidden] { display: none; }
+.ttds-chat-composer label { font-size: .9em; }
+.ttds-chat-composer textarea {
+    width: 100%;
+    min-height: 42px;
+    max-height: 96px;
+    margin: 0;
+    box-sizing: border-box;
+    resize: vertical;
+}
+.ttds-chat-controls, .ttds-chat-options { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.ttds-chat-options label { display: inline-flex; align-items: center; gap: 4px; }
+.ttds-chat-controls .menu_button { width: auto; min-height: 30px; margin: 0; padding-inline: 8px; }
+.ttds-chat-turn + .ttds-chat-turn { border-top: 1px solid var(--ttds-border); margin-top: 10px; padding-top: 10px; }
+.ttds-chat-turn p { margin: 5px 0; white-space: pre-wrap; }
+.ttds-chat-turn .ttds-chat-question { font-weight: 600; }
+.ttds-chat-turn details { margin-block: 5px; }
+.ttds-chat-turn details summary { cursor: pointer; }
+.ttds-chat-turn ul { margin: 4px 0; padding-inline-start: 1.6em; }
