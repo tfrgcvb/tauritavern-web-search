@@ -1,0 +1,10 @@
+{
+  "display_name": "TT DeepSeek AutoSearch (No MCP)",
+  "loading_order": 18,
+  "js": "index.js",
+  "css": "style.css",
+  "generate_interceptor": "ttDeepSeekSearchInterceptor",
+  "author": "Community example (generated with ChatGPT)",
+  "version": "0.2.0",
+  "auto_update": false
+}
