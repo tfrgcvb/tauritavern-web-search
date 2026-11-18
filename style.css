@@ -81,3 +81,20 @@
 .ttds-activity-sources a { color: var(--SmartThemeQuoteColor, inherit); font-weight: 600; text-decoration: underline; }
 .ttds-activity-sources small { display: block; opacity: .78; }
 .ttds-activity-sources p { margin: 3px 0 0; }
+
+.ttds-activity-review {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--ttds-border);
+}
+.ttds-activity-review button {
+    width: auto;
+    min-height: 38px;
+    margin: 0;
+    padding-inline: 12px;
+    white-space: normal;
+}
+#ttds_approve_results { border-color: var(--SmartThemeQuoteColor, #7498bf); }

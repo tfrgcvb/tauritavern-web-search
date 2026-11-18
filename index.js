@@ -16,11 +16,19 @@ const MAX_QUERY = 128;
 const MAX_RESPONSE_CHARS = 6500;
 const CACHE_MS = 10 * 60 * 1000;
 const PROMPT_POSITION = extension_prompt_types.IN_PROMPT;
+const PLAN_INSTRUCTION = [
+    '你为聊天规划联网检索。先分析用户想核实的事实、对应的实体和时效，再判断是否需要外部资料。只输出一个 JSON 对象。',
+    'JSON 示例：{"need_search":true,"query":"项目名称 版本号 官方更新日志","reason":"需要核实该版本的官方变更"}。',
+    '用户明确要求查找、核实出处，或问题涉及最新事实和具体外部资料时才搜索。继续剧情、角色互动、闲聊和创作通常无需搜索。',
+    '需要联网时，选用原文名称、专有名词、必要的版本或日期，组合成一条能命中关键事实的搜索词。优先使用权威来源常用的措辞。',
+    '去掉闲聊、无关词和敏感个人信息。不能确定的实体或版本保持宽泛。query 最多 128 个字符，无需搜索时留空。reason 用一句话说明判断依据。',
+].join('\n');
 
 const defaultConfig = Object.freeze({
     enabled: true,
     mode: 'direct',
     triggerMode: 'manual', // explicit / automatic
+    confirmResults: false,
     relayUrl: '',
     count: 5,
     timeoutSeconds: 25,
@@ -178,32 +186,24 @@ async function requestSearch(rawQuery, opts = options(), fetchImpl = fetch, sign
     }
 }
 
-// Cheap optional routing. This never invokes a Gemini tool. Only the latest
-// user message is sent to the routing model; no full RP transcript is uploaded.
+// Plan the search with the latest user message.
 async function requestDecision(userMessage, cfg = options(), fetchImpl = fetch, signal) {
     const message = String(userMessage || '').trim().slice(0, 950);
     if (!message) return { need_search: false, query: '' };
-    const url = cfg.mode === 'relay' ? relayEndpoint(cfg, 'decide') : DECISION_API;
+    const relay = cfg.mode === 'relay';
+    const url = relay ? relayEndpoint(cfg, 'decide') : DECISION_API;
     const token = activeToken(cfg);
     const request = timedRequest(cfg, signal);
     try {
-        const system = [
-            '你是角色扮演聊天的联网检索路由器。只输出 JSON，不回答用户、不续写剧情。',
-            'JSON 格式: {"need_search":false,"query":""} 或 {"need_search":true,"query":"简短搜索关键词"}。',
-            '仅当用户明确请求互联网/原著出处核验/最新事实，或答案明显依赖外部更新资料时才搜索。',
-            '继续剧情、角色互动、情绪对话、打招呼、改写、创作等无需搜索。',
-            '搜索查询应紧扣事实问题，尽量包含专有名词；不输出私人信息、密钥或聊天记录。',
-            '不要把人物当下不可能知道的未来剧情当成联网需求。',
-            'query 不超过 128 个字，need_search 为 false 时 query 留空。',
-        ].join('\n');
-        const payload = cfg.mode === 'relay'
+        const payload = relay
             ? { message }
             : {
                 model: 'deepseek-flash',
-                messages: [{ role: 'system', content: system }, { role: 'user', content: message }],
-                thinking: { type: 'disabled' },
+                messages: [{ role: 'system', content: PLAN_INSTRUCTION }, { role: 'user', content: message }],
+                thinking: { type: 'enabled' },
+                reasoning_effort: 'low',
                 response_format: { type: 'json_object' },
-                max_tokens: 160,
+                max_tokens: 2048,
                 stream: false,
             };
         const response = await fetchImpl(url, {
@@ -218,12 +218,19 @@ async function requestDecision(userMessage, cfg = options(), fetchImpl = fetch, 
         catch { throw new Error('DeepSeek 联网判断返回了非 JSON 结果。'); }
         if (!response.ok) throw new Error(errorFromHttp(response.status, data, token));
         if (data?.error) throw new Error(compact(String(data.error.message || data.error).replaceAll(token, '[已隐藏]'), 160));
+        const choice = data?.choices?.[0];
+        if (!relay && choice?.finish_reason === 'length') throw new Error('DeepSeek 达到思考输出上限，未能完成搜索计划。');
         let decision;
-        try { decision = cfg.mode === 'relay' ? data : JSON.parse(data?.choices?.[0]?.message?.content); }
+        try { decision = relay ? data : JSON.parse(choice?.message?.content); }
         catch { throw new Error('DeepSeek 联网判断返回了无效的 JSON。'); }
-        if (decision?.need_search === false) return { need_search: false, query: '' };
-        if (decision?.need_search !== true) throw new Error('DeepSeek 联网判断缺少有效的 need_search 字段。');
-        return { need_search: true, query: validateQuery(decision.query) };
+        if (typeof decision?.need_search !== 'boolean') throw new Error('DeepSeek 联网判断缺少有效的 need_search 字段。');
+        if (decision.need_search && typeof decision.query !== 'string') throw new Error('DeepSeek 未提供有效的搜索词。');
+        return {
+            need_search: decision.need_search,
+            query: decision.need_search ? validateQuery(decision.query) : '',
+            reason: typeof decision.reason === 'string' ? compact(decision.reason, 120) : '',
+            thinking: !relay || decision.thinking === true,
+        };
     } catch (err) {
         if (err?.name === 'AbortError') throw new Error('联网判断超时。');
         if (cfg.mode === 'direct' && err instanceof TypeError) {
@@ -326,10 +333,76 @@ function resetActivity() {
     showActivity('暂无联网记录', { detail: '发送消息后查看本轮联网情况。' });
 }
 
-// Stable SillyTavern-compatible generation interceptor. It does not modify chat[]
-// and does not add any LLM tools to the provider request.
-globalThis.ttDeepSeekSearchInterceptor = async function (chat, _contextSize, _abort, type) {
-    emptyPrompt(); // no stale results on non-search turns
+async function prepareSearch(chat, cfg, signal) {
+    const userMessage = latestUserMessage(chat);
+    if (!userMessage.trim()) {
+        showActivity('暂无联网记录');
+        return;
+    }
+    let stage = 'query';
+    let decision = '';
+    let reason = '';
+    let planningNote = '';
+    let query;
+    try {
+        query = extractQuery(userMessage);
+        if (query) {
+            decision = '手动指定搜索';
+        } else if (cfg.triggerMode === 'automatic') {
+            stage = 'decision';
+            showActivity('正在分析', { detail: 'DeepSeek Flash 正在判断是否需要联网并规划搜索词。', kind: 'pending' });
+            const result = await getDecision(userMessage, cfg, signal);
+            if (signal.aborted) return;
+            const cachedDecision = result.cached ? '（缓存）' : '';
+            const method = result.thinking ? 'DeepSeek Flash 思考后判定' : 'DeepSeek Flash 判定';
+            decision = `${method}${result.need_search ? '需要联网' : '无需联网'}${cachedDecision}`;
+            reason = result.reason;
+            planningNote = result.thinking ? '' : '更新 Worker 后可启用思考规划。';
+            if (!result.need_search) {
+                showActivity('无需联网', { decision, reason, detail: planningNote, kind: 'ok' });
+                return;
+            }
+            query = result.query;
+        } else {
+            showActivity('未触发搜索', { detail: '手动模式使用 [[搜:关键词]] 发起搜索。' });
+            return;
+        }
+        stage = 'search';
+        showActivity('正在搜索', { decision, reason, query, detail: planningNote, kind: 'pending' });
+        const { results, cached } = await getResults(query, cfg, signal);
+        if (signal.aborted) return;
+        const { prompt, sources } = formatEvidence(query, results);
+        const detail = [planningNote, cached ? '本轮使用缓存的搜索结果。' : ''].filter(Boolean).join(' ');
+        if (!sources.length) {
+            return {
+                label: '没有可用来源', decision, reason, query, detail,
+                prompt: `[联网搜索结果] 已搜索「${query}」，但没有找到结果。不能把常识当作最新搜索事实。`,
+            };
+        }
+        return { label: `找到 ${sources.length} 条来源`, decision, reason, query, detail, sources, kind: 'ok', prompt };
+    } catch (err) {
+        if (signal.aborted) return;
+        const detail = compact(err?.message || err, 280);
+        if (stage === 'decision') {
+            showActivity('联网判断失败', { detail, kind: 'error' });
+            return;
+        }
+        if (stage === 'query') {
+            return {
+                label: '搜索词无效', detail, kind: 'error',
+                prompt: '[联网搜索结果] 搜索词无效，未联网成功。请不要宣称查询了最新网页。',
+            };
+        }
+        return {
+            label: '搜索失败', decision, reason, query, detail, kind: 'error',
+            prompt: `[联网搜索结果] 本轮搜索「${query}」失败：${detail}。请说明搜索失败，不要假装已经查到网页。`,
+        };
+    }
+}
+
+// The host awaits this hook before sending the chat generation request.
+globalThis.ttDeepSeekSearchInterceptor = async function (chat, _contextSize, abort, type) {
+    emptyPrompt();
     const cfg = options();
     if (!cfg.enabled || !['normal', 'regenerate', 'swipe'].includes(type)) {
         if (activeLookup) resetActivity();
@@ -339,61 +412,34 @@ globalThis.ttDeepSeekSearchInterceptor = async function (chat, _contextSize, _ab
     const lookup = new AbortController();
     const { signal } = lookup;
     activeLookup = lookup;
+    const requiresReview = cfg.confirmResults === true;
+    const abortGeneration = () => abort(true);
+    if (requiresReview) signal.addEventListener('abort', abortGeneration, { once: true });
 
-    const userMessage = latestUserMessage(chat);
-    let stage = 'query';
-    let decision = '';
-    let query;
     try {
-        if (!userMessage.trim()) {
-            resetActivity();
-            return;
-        }
-        query = extractQuery(userMessage);
-        if (query) {
-            decision = '手动指定搜索';
-        } else if (cfg.triggerMode === 'automatic') {
-            stage = 'decision';
-            showActivity('正在判断', { detail: 'DeepSeek Flash 正在判断是否需要联网。', kind: 'pending' });
-            const result = await getDecision(userMessage, cfg, signal);
+        const outcome = await prepareSearch(chat, cfg, signal);
+        if (!outcome || signal.aborted) return;
+        const { label, prompt, ...details } = outcome;
+        if (requiresReview) {
+            const detail = details.detail ? `${label} · ${details.detail}` : label;
+            showActivity('等待确认', { ...details, detail, kind: 'pending' });
+            const choice = await waitForReview(signal);
             if (signal.aborted) return;
-            const cachedDecision = result.cached ? '（缓存）' : '';
-            if (!result.need_search) {
-                showActivity('无需联网', { decision: `DeepSeek Flash 判定无需联网${cachedDecision}`, kind: 'ok' });
+            if (choice !== 'approved') {
+                abortGeneration();
+                if (choice === 'unavailable') status('确认界面不可用，本轮已结束。', 'error');
+                showActivity('本轮已结束', { ...details, detail, kind: 'info' });
                 return;
             }
-            decision = `DeepSeek Flash 判定需要联网${cachedDecision}`;
-            query = result.query;
-        } else {
-            showActivity('未触发搜索', { detail: '手动模式使用 [[搜:关键词]] 发起搜索。' });
-            return;
-        }
-        stage = 'search';
-        showActivity('正在搜索', { decision, query, kind: 'pending' });
-        const { results, cached } = await getResults(query, cfg, signal);
-        if (signal.aborted) return;
-        const { prompt, sources } = formatEvidence(query, results);
-        const detail = cached ? '本轮使用缓存的搜索结果。' : '';
-        if (!sources.length) {
-            injectPrompt(`[联网搜索结果] 已搜索「${query}」，但没有找到结果。不能把常识当作最新搜索事实。`);
-            showActivity('没有可用来源', { decision, query, detail });
-            return;
         }
         injectPrompt(prompt);
-        showActivity(`找到 ${sources.length} 条来源`, { decision, query, detail, sources, kind: 'ok' });
+        showActivity(label, details);
     } catch (err) {
-        if (signal.aborted) return;
-        const detail = compact(err?.message || err, 280);
-        if (stage === 'query') {
-            injectPrompt('[联网搜索结果] 搜索词无效，未联网成功。请不要宣称查询了最新网页。');
-            showActivity('搜索词无效', { detail, kind: 'error' });
-        } else if (stage === 'decision') {
-            showActivity('联网判断失败', { detail, kind: 'error' });
-        } else {
-            injectPrompt(`[联网搜索结果] 本轮搜索「${query}」失败：${detail}。请说明搜索失败，不要假装已经查到网页。`);
-            showActivity('搜索失败', { decision, query, detail, kind: 'error' });
-        }
+        if (requiresReview) abortGeneration();
+        status('联网流程未能完成。', 'error');
+        throw err;
     } finally {
+        signal.removeEventListener('abort', abortGeneration);
         if (activeLookup === lookup) activeLookup = null;
     }
 };
@@ -416,13 +462,13 @@ function createSource({ title, url, host, date, summary }) {
     return item;
 }
 
-function showActivity(label, { decision = '', query = '', detail = '', sources = [], kind = 'info' } = {}) {
+function showActivity(label, { decision = '', reason = '', query = '', detail = '', sources = [], kind = 'info' } = {}) {
     const activity = document.getElementById('ttds_activity');
     if (!activity) return;
 
     activity.dataset.kind = kind;
     activity.querySelector('.ttds-activity-state').textContent = label;
-    for (const [field, value] of Object.entries({ decision, query })) {
+    for (const [field, value] of Object.entries({ decision, reason, query })) {
         const row = activity.querySelector(`[data-ttds-field="${field}"]`);
         row.hidden = !value;
         row.querySelector('dd').textContent = value;
@@ -435,6 +481,36 @@ function showActivity(label, { decision = '', query = '', detail = '', sources =
     list.replaceChildren(...sources.map(createSource));
 }
 
+async function waitForReview(signal) {
+    if (signal.aborted) return 'cancelled';
+    const activity = document.getElementById('ttds_activity');
+    const review = activity?.querySelector('.ttds-activity-review');
+    const approve = review?.querySelector('#ttds_approve_results');
+    const decline = review?.querySelector('#ttds_decline_results');
+    if (!approve || !decline || activity.hidden || activity.getClientRects?.().length === 0) return 'unavailable';
+
+    return new Promise(resolve => {
+        const accept = () => finish('approved');
+        const reject = () => finish('declined');
+        const cancel = () => finish('cancelled');
+
+        function finish(choice) {
+            review.hidden = true;
+            signal.removeEventListener('abort', cancel);
+            approve.removeEventListener('click', accept);
+            decline.removeEventListener('click', reject);
+            resolve(choice);
+        }
+
+        approve.addEventListener('click', accept);
+        decline.addEventListener('click', reject);
+        signal.addEventListener('abort', cancel, { once: true });
+        activity.open = true;
+        review.hidden = false;
+        activity.querySelector('summary')?.focus?.({ preventScroll: true });
+    });
+}
+
 function mountActivity(fallback) {
     const html = `
 <details class="ttds-activity" id="ttds_activity">
@@ -442,10 +518,15 @@ function mountActivity(fallback) {
   <div class="ttds-activity-body">
     <dl class="ttds-activity-meta">
       <div data-ttds-field="decision" hidden><dt>判断</dt><dd></dd></div>
+      <div data-ttds-field="reason" hidden><dt>依据</dt><dd></dd></div>
       <div data-ttds-field="query" hidden><dt>搜索词</dt><dd></dd></div>
     </dl>
     <p class="ttds-activity-note" hidden></p>
     <ol class="ttds-activity-sources" aria-label="供本轮回复参考的网页来源" hidden></ol>
+  </div>
+  <div class="ttds-activity-review" role="group" aria-label="联网结果确认" hidden>
+    <button class="menu_button" id="ttds_decline_results" type="button">拒绝并结束</button>
+    <button class="menu_button" id="ttds_approve_results" type="button">同意并生成</button>
   </div>
 </details>`;
     const composer = document.getElementById('send_form');
@@ -471,7 +552,8 @@ function createUI() {
   <div class="inline-drawer-content">
     <label class="checkbox_label"><input type="checkbox" id="ttds_enabled" />启用联网搜索</label>
     <label for="ttds_trigger">触发方式</label>
-    <select id="ttds_trigger" class="text_pole"><option value="manual">手动：仅搜索标记触发（不收判断费）</option><option value="automatic">自动：DeepSeek Flash 判断是否联网</option></select>
+    <select id="ttds_trigger" class="text_pole"><option value="manual">手动搜索（搜索标记触发）</option><option value="automatic">自动规划（DeepSeek Flash）</option></select>
+    <label class="checkbox_label"><input type="checkbox" id="ttds_confirm_results" />生成前手动确认联网结果</label>
     <label for="ttds_mode">请求方式</label>
     <select id="ttds_mode" class="text_pole"><option value="direct">直连 DeepSeek（若 CORS 允许）</option><option value="relay">Cloudflare Worker 中继（推荐安卓，需部署新版 Worker）</option></select>
     <div id="ttds_direct_box">
@@ -485,8 +567,8 @@ function createUI() {
     <div id="ttds_relay_box" hidden><label for="ttds_relay_url">中继地址</label><input id="ttds_relay_url" class="text_pole" type="url" placeholder="https://your-worker.workers.dev/search"/><label for="ttds_relay_token">中继访问口令（仅本次运行）</label><input id="ttds_relay_token" class="text_pole" type="password" autocomplete="off" placeholder="在 Worker 中自行设置的口令"/></div>
     <label for="ttds_count">每次结果条数（1～10）</label><input id="ttds_count" class="text_pole" type="number" min="1" max="10" />
     <label for="ttds_timeout">超时秒数（5～60）</label><input id="ttds_timeout" class="text_pole" type="number" min="5" max="60" />
-    <div class="ttds-actions"><button class="menu_button" id="ttds_test" type="button">测试搜索</button><button class="menu_button" id="ttds_test_router" type="button">测试自动判断</button><button class="menu_button" id="ttds_clear" type="button">清除密钥和中继口令</button></div>
-    <p class="ttds-help">自动模式由 DeepSeek Flash 判断是否需要联网。任一模式都可以用 <code>[[搜:关键词]]</code> 直接触发搜索。</p>
+    <div class="ttds-actions"><button class="menu_button" id="ttds_test" type="button">测试搜索</button><button class="menu_button" id="ttds_test_router" type="button">测试搜索规划</button><button class="menu_button" id="ttds_clear" type="button">清除密钥和中继口令</button></div>
+    <p class="ttds-help">自动模式由 DeepSeek Flash 思考并规划搜索词。任一模式都可以用 <code>[[搜:关键词]]</code> 直接触发搜索。</p>
     <div id="ttds_status" class="ttds-status" aria-live="polite" hidden></div>
   </div>
 </section>`;
@@ -499,6 +581,7 @@ function createUI() {
     $id('ttds_enabled').checked = !!cfg.enabled;
     $id('ttds_mode').value = cfg.mode;
     $id('ttds_trigger').value = cfg.triggerMode;
+    $id('ttds_confirm_results').checked = cfg.confirmResults === true;
     $id('ttds_relay_url').value = cfg.relayUrl;
     $id('ttds_count').value = String(cfg.count);
     $id('ttds_timeout').value = String(cfg.timeoutSeconds);
@@ -526,6 +609,7 @@ function createUI() {
     $id('ttds_enabled').addEventListener('change', e => save('enabled', !!e.target.checked));
     $id('ttds_mode').addEventListener('change', e => { save('mode', e.target.value); switchMode(); });
     $id('ttds_trigger').addEventListener('change', e => save('triggerMode', e.target.value));
+    $id('ttds_confirm_results').addEventListener('change', e => save('confirmResults', e.target.checked));
     $id('ttds_relay_url').addEventListener('change', e => save('relayUrl', e.target.value.trim()));
     $id('ttds_count').addEventListener('change', e => save('count', Math.min(10, Math.max(1, Number(e.target.value) || 5))));
     $id('ttds_timeout').addEventListener('change', e => save('timeoutSeconds', Math.min(60, Math.max(5, Number(e.target.value) || 25))));
@@ -575,9 +659,11 @@ function createUI() {
         activeTest = true;
         $id('ttds_test_router').disabled = true;
         try {
-            status('测试 DeepSeek 联网判断……');
-            const result = await requestDecision('请查询 2026 年今天最新的 AI 新闻', options());
-            status(`判断成功：${result.need_search ? '需要搜索 / ' + result.query : '无需搜索'}`, 'ok');
+            status('测试 DeepSeek 搜索规划……');
+            const result = await requestDecision('请查询 DeepSeek 最新版本的官方更新日志', options());
+            const decision = result.need_search ? `需要搜索 · ${result.query}` : '无需搜索';
+            const method = result.thinking ? '思考规划成功' : '联网判断成功（更新 Worker 后可启用思考规划）';
+            status(`${method} · ${decision}`, 'ok');
         } catch (err) {
             status(`判断失败：${err?.message || err}`, 'error');
         } finally {
