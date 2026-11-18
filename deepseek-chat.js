@@ -1,5 +1,7 @@
 export const MESSAGES_API = 'https://api.deepseek.com/anthropic/v1/messages';
-const MAX_CHAT_BODY_CHARS = 2_000_000;
+export const MAX_CONTEXT_CHARS = 258_000;
+export const MAX_HISTORY_JSON_CHARS = 1_500_000;
+const MAX_CHAT_BODY_CHARS = 4_000_000;
 const WEB_BLOCK_TYPES = ['server_tool_use', 'web_search_tool_result', 'web_fetch_tool_result'];
 const CHAT_INSTRUCTION = [
     '你是酒馆的资料助手。回答用户在 DeepSeek 输入框里提出的问题，提供另一位聊天模型可以直接使用的资料。',

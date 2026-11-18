@@ -7,15 +7,13 @@ const SEARCH_API = 'https://api.deepseek.com/v1/tools/search';
 const FETCH_API = 'https://api.deepseek.com/v1/tools/fetch';
 const CHAT_API = 'https://api.deepseek.com/chat/completions';
 const MESSAGES_API = 'https://api.deepseek.com/anthropic/v1/messages';
-const MAX_CHAT_BODY_CHARS = 2_000_000;
-const MAX_PAGE_CHARS = 32000;
-const MAX_ANALYSIS_CHARS = 120000;
-const MAX_ANALYSIS_BODY_CHARS = 1000000;
-const MAX_DECIDE_BODY_CHARS = 40000;
-const MAX_HISTORY_MESSAGES = 6;
-const MAX_HISTORY_CHARS = 4000;
-const MAX_HISTORY_MESSAGE_CHARS = 1200;
+const MAX_CONTEXT_CHARS = 258_000;
+const MAX_HISTORY_JSON_CHARS = 1_500_000;
+const MAX_LONG_REQUEST_CHARS = 4_000_000;
+const MAX_CHAT_SYSTEM_CHARS = MAX_HISTORY_JSON_CHARS + 32_000;
+const MAX_DECIDE_BODY_CHARS = MAX_HISTORY_JSON_CHARS + 10_000;
 const MAX_HISTORY_NAME_CHARS = 64;
+const CONTEXT_LIMITS = { history_supported: true, context_char_limit: MAX_CONTEXT_CHARS };
 const CORS = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -96,7 +94,7 @@ async function streamChat(data, token, signal) {
             : message?.role !== 'assistant' || !Array.isArray(message.content) || !message.content.length)) {
         return reply({ error: { message: 'DeepSeek 对话需要有效的用户和助手消息。' } }, 400);
     }
-    if (typeof data.system !== 'string' || data.system.length > 32000) {
+    if (typeof data.system !== 'string' || data.system.length > MAX_CHAT_SYSTEM_CHARS) {
         return reply({ error: { message: 'DeepSeek 对话的系统提示无效。' } }, 400);
     }
     const thinking = data.thinking?.type !== 'disabled';
@@ -131,15 +129,20 @@ async function streamChat(data, token, signal) {
 function boundedHistory(input) {
     if (!Array.isArray(input)) return [];
     const history = [];
-    let remaining = MAX_HISTORY_CHARS;
-    for (const message of input.slice(-MAX_HISTORY_MESSAGES).reverse()) {
-        if (remaining <= 0) break;
+    let remaining = MAX_CONTEXT_CHARS;
+    let jsonRemaining = MAX_HISTORY_JSON_CHARS - 2;
+    for (let i = input.length - 1; i >= 0 && remaining > 0; i--) {
+        const message = input[i];
         if (!['user', 'assistant'].includes(message?.role) || typeof message.content !== 'string') continue;
-        const content = message.content.slice(-Math.min(remaining, MAX_HISTORY_MESSAGE_CHARS)).replace(/^[\uDC00-\uDFFF]/, '');
+        const content = message.content.slice(-remaining).replace(/^[\uDC00-\uDFFF]/, '');
         if (!content.trim()) continue;
         const name = typeof message.name === 'string' ? message.name.trim().slice(0, MAX_HISTORY_NAME_CHARS) : '';
-        history.push({ role: message.role, ...(name ? { name } : {}), content });
+        const entry = { role: message.role, ...(name ? { name } : {}), content };
+        const size = JSON.stringify(entry).length + 1;
+        if (size > jsonRemaining) break;
+        history.push(entry);
         remaining -= content.length;
+        jsonRemaining -= size;
     }
     return history.reverse();
 }
@@ -149,7 +152,7 @@ function analysisInput(data) {
     const query = value => Array.from(text(value, 256)).slice(0, 128).join('');
     const sources = data.sources.slice(0, 30);
     const readablePages = sources.filter(source => typeof source?.content === 'string' && source.content.length).length;
-    const pageLimit = Math.min(MAX_PAGE_CHARS, Math.floor(MAX_ANALYSIS_CHARS / Math.max(1, readablePages)));
+    const pageLimit = Math.floor(MAX_CONTEXT_CHARS / Math.max(1, readablePages));
     const history = boundedHistory(data.history);
     return {
         question: text(data.question, 950),
@@ -187,7 +190,7 @@ export default {
         if (request.headers.get('Authorization') !== `Bearer ${env.TT_RELAY_TOKEN}`) return reply({ error: { message: '访问口令无效。' } }, 401);
         try {
             const bodyText = await request.text();
-            const bodyLimit = { '/chat': MAX_CHAT_BODY_CHARS, '/analyze': MAX_ANALYSIS_BODY_CHARS, '/decide': MAX_DECIDE_BODY_CHARS, '/fetch': 9000 }[path] ?? 3000;
+            const bodyLimit = { '/chat': MAX_LONG_REQUEST_CHARS, '/analyze': MAX_LONG_REQUEST_CHARS, '/decide': MAX_DECIDE_BODY_CHARS, '/fetch': 9000 }[path] ?? 3000;
             if (bodyText.length > bodyLimit) return reply({ error: { message: '请求体过大。' } }, 413);
             let data;
             try { data = JSON.parse(bodyText); }
@@ -197,7 +200,7 @@ export default {
             if (path === '/chat') return await streamChat(data, token, signal);
             if (path === '/decide') {
                 const message = String(data?.message || '').trim().slice(0, 950);
-                if (!message) return reply({ need_search: false, query: '', reasoning_effort: 'max', history_supported: true });
+                if (!message) return reply({ need_search: false, query: '', reasoning_effort: 'max', ...CONTEXT_LIMITS });
                 const history = boundedHistory(data?.history);
                 const input = history.length ? JSON.stringify({ message, history }) : message;
                 const decision = await maxThinking(PLAN_INSTRUCTION, input, token, signal);
@@ -209,14 +212,14 @@ export default {
                     reason: typeof decision.reason === 'string' ? decision.reason.trim().slice(0, 120) : '',
                     thinking: true,
                     reasoning_effort: 'max',
-                    history_supported: true,
+                    ...CONTEXT_LIMITS,
                 });
             }
             if (path === '/analyze') {
                 if (typeof data?.question !== 'string' || !Array.isArray(data.sources)) return reply({ error: { message: '缺少研究问题或来源。' } }, 400);
                 const analysis = await maxThinking(ANALYSIS_INSTRUCTION, JSON.stringify(analysisInput(data)), token, signal);
                 if (!Array.isArray(analysis?.findings)) return reply({ error: { message: '研究结果缺少 findings 数组。' } }, 502);
-                return reply({ next_query: analysis.next_query, findings: analysis.findings, limitations: analysis.limitations, reasoning_effort: 'max', history_supported: true });
+                return reply({ next_query: analysis.next_query, findings: analysis.findings, limitations: analysis.limitations, reasoning_effort: 'max', ...CONTEXT_LIMITS });
             }
             if (path === '/fetch') {
                 const url = fetchURL(data?.url);

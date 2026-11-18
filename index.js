@@ -6,7 +6,7 @@
 import { eventSource, event_types, setExtensionPrompt, extension_prompt_types, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { getCurrentUserHandle } from '../../../user.js';
-import { MESSAGES_API, buildChatBody, parsePageURL, readChatReply } from './deepseek-chat.js';
+import { MESSAGES_API, MAX_CONTEXT_CHARS, MAX_HISTORY_JSON_CHARS, buildChatBody, parsePageURL, readChatReply } from './deepseek-chat.js';
 
 const EXT_NAME = 'tt-deepseek-search';
 const CONFIG_KEY = 'ttDeepSeekSearch';
@@ -17,16 +17,10 @@ const THINKING_API = 'https://api.deepseek.com/chat/completions';
 const MAX_QUERY = 128;
 const MAX_SEARCHES = 3;
 const MAX_PAGES_PER_SEARCH = 2;
-const DEFAULT_PAGE_CHARS = 20000;
 const MIN_PAGE_CHARS = 8000;
-const MAX_PAGE_CHARS = 32000;
-const MAX_ANALYSIS_CHARS = 120000;
 const LEGACY_RELAY_PAGE_CHARS = 6000;
 const PAGE_OMISSION = '\n\n[已省略部分网页正文]\n\n';
 const MAX_FEEDBACK_CHARS = 600;
-const MAX_HISTORY_MESSAGES = 6;
-const MAX_HISTORY_CHARS = 4000;
-const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_HISTORY_NAME_CHARS = 64;
 const THINKING_TIMEOUT_MS = 120000;
 const CHAT_TIMEOUT_MS = 600000;
@@ -72,7 +66,7 @@ const defaultConfig = Object.freeze({
     includeHistory: false,
     relayUrl: '',
     searchLanguages: Object.freeze([]),
-    pageChars: DEFAULT_PAGE_CHARS,
+    pageChars: MAX_CONTEXT_CHARS,
     count: 5,
     timeoutSeconds: 25,
 });
@@ -179,17 +173,22 @@ function latestUserIndex(chat) {
 function recentChatHistory(chat) {
     // The generation hook receives prepared prompt text. Read history from the visible chat instead.
     const history = [];
-    let remaining = MAX_HISTORY_CHARS;
-    for (let i = latestUserIndex(chat) - 1; i >= 0 && history.length < MAX_HISTORY_MESSAGES && remaining > 0; i--) {
+    let remaining = MAX_CONTEXT_CHARS;
+    let jsonRemaining = MAX_HISTORY_JSON_CHARS - 2;
+    for (let i = latestUserIndex(chat) - 1; i >= 0 && remaining > 0; i--) {
         const msg = chat[i];
         if (!msg || msg.is_system || msg.is_hidden || typeof msg.mes !== 'string') continue;
         const role = msg.role ?? (typeof msg.is_user === 'boolean' ? (msg.is_user ? 'user' : 'assistant') : '');
         if (role !== 'user' && role !== 'assistant') continue;
-        const content = compact(msg.mes).slice(-Math.min(remaining, MAX_HISTORY_MESSAGE_CHARS)).replace(/^[\uDC00-\uDFFF]/, '');
+        const content = compact(msg.mes).slice(-remaining).replace(/^[\uDC00-\uDFFF]/, '');
         if (!content.trim()) continue;
         const name = typeof msg.name === 'string' ? compact(msg.name, MAX_HISTORY_NAME_CHARS) : '';
-        history.push({ role, ...(name ? { name } : {}), content });
+        const entry = { role, ...(name ? { name } : {}), content };
+        const size = JSON.stringify(entry).length + 1;
+        if (size > jsonRemaining) break;
+        history.push(entry);
         remaining -= content.length;
+        jsonRemaining -= size;
     }
     return history.reverse();
 }
@@ -331,6 +330,9 @@ async function requestConversation(body, cfg, signal, onProgress) {
         if (relay && response.status === 404) throw new Error('请重新部署新版 Worker 以启用 DeepSeek 对话。');
         if (!response.ok) {
             const error = await response.json().catch(() => null);
+            if (relay && (response.status === 413 || error?.error?.message === 'DeepSeek 对话的系统提示无效。')) {
+                throw new Error('中继无法接收长上下文。请重新部署新版 Worker 后重试。');
+            }
             throw new Error(errorFromHttp(response.status, error, token));
         }
         if (!response.body || !response.headers.get('Content-Type')?.toLowerCase().includes('text/event-stream')) {
@@ -350,12 +352,22 @@ async function requestConversation(body, cfg, signal, onProgress) {
     }
 }
 
+function exceedsOldRelayContext(input) {
+    const history = input.history ?? [];
+    const pages = input.sources?.filter(source => source.content) ?? [];
+    const pageLimit = Math.min(32_000, Math.floor(120_000 / Math.max(1, pages.length)));
+    return history.length > 6 || history.some(message => message.content.length > 1_200)
+        || history.reduce((sum, message) => sum + message.content.length, 0) > 4_000
+        || pages.some(page => page.content.length > pageLimit);
+}
+
 async function requestThinking(path, input, instruction, cfg, fetchImpl, signal) {
     const relay = cfg.mode === 'relay';
     const url = relay ? relayEndpoint(cfg, path) : THINKING_API;
     const token = activeToken(cfg);
     const request = timedRequest(THINKING_TIMEOUT_MS, signal);
     try {
+        const needsLongContext = relay && exceedsOldRelayContext(input);
         const content = path === 'decide' && !input.history?.length ? input.message : JSON.stringify(input);
         const payload = relay
             ? input
@@ -376,7 +388,7 @@ async function requestThinking(path, input, instruction, cfg, fetchImpl, signal)
             credentials: 'omit',
         });
         if (relay && response.status === 404) throw new Error('中继缺少研究接口。请重新部署新版 worker/worker.js。');
-        if (relay && path === 'decide' && input.history?.length && response.status === 413) throw new Error('中继无法接收对话上文。请更新 Worker 后重试。');
+        if (needsLongContext && response.status === 413) throw new Error('中继无法接收长上下文。请重新部署新版 Worker 后重试。');
         let data;
         try { data = await response.json(); }
         catch { throw new Error('DeepSeek 研究接口返回了非 JSON 结果。'); }
@@ -385,6 +397,9 @@ async function requestThinking(path, input, instruction, cfg, fetchImpl, signal)
         if (relay) {
             if (data?.reasoning_effort !== 'max') throw new Error('请重新部署新版 worker/worker.js，以启用最高思考强度和多轮研究。');
             if (input.history?.length && data.history_supported !== true) throw new Error('请重新部署新版 Worker 以启用对话上文。');
+            if (needsLongContext && !(data.context_char_limit >= MAX_CONTEXT_CHARS)) {
+                throw new Error('当前 Worker 会截断长上下文。请重新部署新版 Worker 后重试。');
+            }
             return data;
         }
         const choice = data?.choices?.[0];
@@ -432,8 +447,8 @@ function compact(raw, maximum = Infinity) {
 
 function pageCharacterLimit(value) {
     const target = Number(value);
-    if (!Number.isFinite(target) || target <= 0) return DEFAULT_PAGE_CHARS;
-    return Math.min(MAX_PAGE_CHARS, Math.max(MIN_PAGE_CHARS, Math.floor(target)));
+    if (!Number.isFinite(target) || target <= 0) return MAX_CONTEXT_CHARS;
+    return Math.min(MAX_CONTEXT_CHARS, Math.max(MIN_PAGE_CHARS, Math.floor(target)));
 }
 
 function researchKeywords(question, feedback, queries) {
@@ -501,7 +516,7 @@ function selectPagePassages(content, limit, keywords) {
 function sourcesForAnalysis(collected, cfg, question, feedback, queries) {
     const sources = [...collected.values()];
     const readablePages = sources.filter(source => source.content).length;
-    const limit = Math.min(pageCharacterLimit(cfg.pageChars), Math.floor(MAX_ANALYSIS_CHARS / Math.max(1, readablePages)));
+    const limit = Math.min(pageCharacterLimit(cfg.pageChars), Math.floor(MAX_CONTEXT_CHARS / Math.max(1, readablePages)));
     const keywords = researchKeywords(question, feedback, queries);
     return sources.map(({ id, title, host, date, summary, content }) => ({
         id, title, host, date, summary, content: selectPagePassages(content, limit, keywords),
@@ -1195,7 +1210,7 @@ function createUI() {
     <select id="ttds_trigger" class="text_pole"><option value="chat">对话与智能搜索</option><option value="standalone">独立 Search/Fetch 网页研究</option></select>
     <label class="checkbox_label"><input type="checkbox" id="ttds_confirm_results" />发送前手动确认 DeepSeek 回复</label>
     <label class="checkbox_label"><input type="checkbox" id="ttds_include_history" />附带当前对话上文</label>
-    <p class="ttds-help">让 DeepSeek 判断联网和分析资料时参考本轮前最近 ${MAX_HISTORY_MESSAGES} 条用户或角色发言，正文合计最多 ${MAX_HISTORY_CHARS.toLocaleString()} 字符。</p>
+    <p class="ttds-help">让 DeepSeek 参考本轮前最近的可见用户和角色发言，正文合计最多 ${MAX_CONTEXT_CHARS.toLocaleString()} 字符。</p>
     <details class="ttds-language-picker">
       <summary>搜索结果语言 <span id="ttds_language_summary"></span></summary>
       <p class="ttds-help">独立 Search/Fetch 的每轮搜索只保留勾选的语言。全部取消勾选时不限。</p>
@@ -1213,9 +1228,9 @@ function createUI() {
     </div>
     <div id="ttds_relay_box" hidden><label for="ttds_relay_url">中继地址</label><input id="ttds_relay_url" class="text_pole" type="url" placeholder="https://your-worker.workers.dev/search"/><label for="ttds_relay_token">中继访问口令（仅本次运行）</label><input id="ttds_relay_token" class="text_pole" type="password" autocomplete="off" placeholder="在 Worker 中自行设置的口令"/></div>
     <label for="ttds_count">每次结果条数（1～10）</label><input id="ttds_count" class="text_pole" type="number" min="1" max="10" />
-    <label for="ttds_page_chars">单页分析正文上限（${MIN_PAGE_CHARS.toLocaleString()}～${MAX_PAGE_CHARS.toLocaleString()} 字符）</label>
-    <input id="ttds_page_chars" class="text_pole" type="number" min="${MIN_PAGE_CHARS}" max="${MAX_PAGE_CHARS}" inputmode="numeric" />
-    <p class="ttds-help">长网页优先保留与问题有关的段落。每次分析合计最多 ${MAX_ANALYSIS_CHARS.toLocaleString()} 字符。</p>
+    <label for="ttds_page_chars">单页分析正文上限（${MIN_PAGE_CHARS.toLocaleString()}～${MAX_CONTEXT_CHARS.toLocaleString()} 字符）</label>
+    <input id="ttds_page_chars" class="text_pole" type="number" min="${MIN_PAGE_CHARS}" max="${MAX_CONTEXT_CHARS}" inputmode="numeric" />
+    <p class="ttds-help">长网页优先保留与问题有关的段落。每次分析的网页正文合计最多 ${MAX_CONTEXT_CHARS.toLocaleString()} 字符。</p>
     <label for="ttds_timeout">搜索和读取超时秒数（5～60）</label><input id="ttds_timeout" class="text_pole" type="number" min="5" max="60" />
     <div class="ttds-actions"><button class="menu_button" id="ttds_test" type="button">测试搜索和读取</button><button class="menu_button" id="ttds_test_router" type="button">测试搜索规划</button><button class="menu_button" id="ttds_clear" type="button">清除密钥和中继口令</button></div>
     <p class="ttds-help">DeepSeek 输入框中可用 <code>[[搜:关键词]]</code> 或 <code>[[读:网址]]</code> 调用独立 Search/Fetch。每次独立研究最多搜索 ${MAX_SEARCHES} 次，每次读取最多 ${MAX_PAGES_PER_SEARCH} 篇网页。</p>
