@@ -21,6 +21,12 @@ const MAX_FEEDBACK_CHARS = 600;
 const THINKING_TIMEOUT_MS = 120000;
 const CACHE_MS = 10 * 60 * 1000;
 const PROMPT_POSITION = extension_prompt_types.IN_PROMPT;
+const SEARCH_LANGUAGES = {
+    en: '英语', zh: '中文', ja: '日语', ko: '韩语',
+    fr: '法语', de: '德语', es: '西班牙语', pt: '葡萄牙语',
+    ru: '俄语', it: '意大利语', ar: '阿拉伯语', hi: '印地语',
+    nl: '荷兰语', vi: '越南语', th: '泰语', id: '印尼语',
+};
 const PLAN_INSTRUCTION = [
     '你为聊天规划联网检索。先分析用户想核实的事实、对应的实体和时效，再判断是否需要外部资料。只输出一个 JSON 对象。',
     'JSON 示例：{"need_search":true,"query":"项目名称 版本号 官方更新日志","reason":"需要核实该版本的官方变更"}。',
@@ -43,6 +49,7 @@ const defaultConfig = Object.freeze({
     triggerMode: 'manual', // explicit / automatic
     confirmResults: false,
     relayUrl: '',
+    searchLanguages: Object.freeze([]),
     count: 5,
     timeoutSeconds: 25,
 });
@@ -71,6 +78,25 @@ function validateQuery(raw) {
         throw new Error(`搜索词长度必须在 1～${MAX_QUERY} 个字符之间（目前 ${len} 个）。`);
     }
     return query;
+}
+
+function selectedLanguages(value) {
+    return Array.isArray(value) ? Object.keys(SEARCH_LANGUAGES).filter(code => value.includes(code)) : [];
+}
+
+function applySearchLanguages(query, selection) {
+    const languages = selectedLanguages(selection);
+    if (!languages.length) return validateQuery(query);
+
+    // Only replace standalone operators. Quoted phrases can contain literal lang: text.
+    const tokens = query.match(/(?:[^\s"]|"(?:[^"\\]|\\.)*")+/g) ?? [];
+    const terms = tokens.filter(token => !/^-?lang:/i.test(token));
+    if (!terms.length) throw new Error('请在语言条件之外填写搜索词。');
+    const filtered = `${terms.join(' ')} lang:${languages.join(',')}`;
+    if (Array.from(filtered).length > MAX_QUERY) {
+        throw new Error(`搜索词和语言条件合计最多 ${MAX_QUERY} 个字符。请缩短搜索词或减少所选语言。`);
+    }
+    return filtered;
 }
 
 function extractQuery(message) {
@@ -455,17 +481,18 @@ async function prepareSearch(userMessage, cfg, signal, { feedback = '', previous
 
         const searched = new Set();
         while (query && queries.length < MAX_SEARCHES) {
-            const queryKey = query.normalize('NFKC').replace(/\s+/g, ' ').toLowerCase();
+            const effectiveQuery = applySearchLanguages(query, cfg.searchLanguages);
+            const queryKey = effectiveQuery.normalize('NFKC').replace(/\s+/g, ' ').toLowerCase();
             if (searched.has(queryKey)) {
                 issue = 'DeepSeek 提议了已用过的搜索词，本次研究在这里结束。';
                 break;
             }
             searched.add(queryKey);
-            queries.push(query);
+            queries.push(effectiveQuery);
             const round = queries.length;
             const progress = { decision, reason, query: queries.join('\n'), feedback, kind: 'pending' };
             showActivity(`搜索 ${round}/${MAX_SEARCHES}`, progress);
-            const results = await getResults(query, cfg, signal, Boolean(feedback));
+            const results = await getResults(effectiveQuery, cfg, signal, Boolean(feedback));
             if (signal.aborted) return;
             const candidates = collectSources(collected, results).slice(0, MAX_PAGES_PER_SEARCH);
             if (candidates.length) {
@@ -686,6 +713,9 @@ function mountActivity(fallback) {
 }
 
 function createUI() {
+    const languageOptions = Object.entries(SEARCH_LANGUAGES).map(([code, label]) =>
+        `<label class="checkbox_label"><input type="checkbox" value="${code}" />${label}</label>`,
+    ).join('');
     const html = `
 <section class="inline-drawer ttds-panel" id="ttds_panel">
   <div class="inline-drawer-toggle inline-drawer-header"><b>🔎 DeepSeek 联网搜索（无 MCP）</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
@@ -694,6 +724,11 @@ function createUI() {
     <label for="ttds_trigger">触发方式</label>
     <select id="ttds_trigger" class="text_pole"><option value="manual">手动搜索（搜索标记触发）</option><option value="automatic">自动规划（DeepSeek Flash）</option></select>
     <label class="checkbox_label"><input type="checkbox" id="ttds_confirm_results" />生成前手动确认联网结果</label>
+    <details class="ttds-language-picker">
+      <summary>搜索结果语言 <span id="ttds_language_summary"></span></summary>
+      <p class="ttds-help">只保留勾选的语言。全部取消勾选时不限。此设置应用到每轮搜索。</p>
+      <div class="ttds-language-options" id="ttds_language_options" role="group" aria-label="要保留的网页语言">${languageOptions}</div>
+    </details>
     <label for="ttds_mode">请求方式</label>
     <select id="ttds_mode" class="text_pole"><option value="direct">直连 DeepSeek（若 CORS 允许）</option><option value="relay">Cloudflare Worker 中继（推荐安卓，需部署新版 Worker）</option></select>
     <div id="ttds_direct_box">
@@ -725,6 +760,13 @@ function createUI() {
     $id('ttds_relay_url').value = cfg.relayUrl;
     $id('ttds_count').value = String(cfg.count);
     $id('ttds_timeout').value = String(cfg.timeoutSeconds);
+    const languageInputs = [...$id('ttds_language_options').querySelectorAll('input')];
+    function updateLanguageSummary(languages) {
+        $id('ttds_language_summary').textContent = languages.map(code => SEARCH_LANGUAGES[code]).join('、') || '不限';
+    }
+    const languages = selectedLanguages(cfg.searchLanguages);
+    for (const input of languageInputs) input.checked = languages.includes(input.value);
+    updateLanguageSummary(languages);
     const directKey = $id('ttds_direct_key');
     const rememberKey = $id('ttds_remember_key');
     function refreshDeviceKeyControl() {
@@ -753,6 +795,11 @@ function createUI() {
     $id('ttds_relay_url').addEventListener('change', e => save('relayUrl', e.target.value.trim()));
     $id('ttds_count').addEventListener('change', e => save('count', Math.min(10, Math.max(1, Number(e.target.value) || 5))));
     $id('ttds_timeout').addEventListener('change', e => save('timeoutSeconds', Math.min(60, Math.max(5, Number(e.target.value) || 25))));
+    $id('ttds_language_options').addEventListener('change', () => {
+        const selection = languageInputs.filter(input => input.checked).map(input => input.value);
+        save('searchLanguages', selection);
+        updateLanguageSummary(selection);
+    });
     function credentialsChanged() {
         generationCache.clear();
         decisionCache.clear();
@@ -816,10 +863,12 @@ function createUI() {
         $id('ttds_test').disabled = true;
         try {
             status('测试 DeepSeek Search 和 Fetch……');
-            const result = await requestSearch('DeepSeek API 官方文档', options());
+            const cfg = options();
+            const query = applySearchLanguages('DeepSeek API documentation', cfg.searchLanguages);
+            const result = await requestSearch(query, cfg);
             const [source] = collectSources(new Map(), result);
             if (!source) throw new Error('Search 未返回可读取的网页。');
-            await requestPage(source.url, options());
+            await requestPage(source.url, cfg);
             status(`Search 找到 ${result.length} 条结果，Fetch 已读取网页正文。`, 'ok');
         } catch (err) {
             status(`测试失败：${err?.message || err}`, 'error');

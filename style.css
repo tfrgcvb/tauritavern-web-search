@@ -9,6 +9,25 @@
 .ttds-panel .ttds-actions button { min-height: 38px; }
 .ttds-panel .ttds-help { margin: 10px 0 4px; line-height: 1.65; font-size: .9em; opacity: .84; }
 .ttds-panel .ttds-help code { font-size: .9em; user-select: all; overflow-wrap: anywhere; }
+.ttds-language-picker {
+    margin-top: 10px;
+    padding-inline: 10px;
+    border: 1px solid var(--SmartThemeBorderColor, #888);
+    border-radius: 8px;
+}
+.ttds-language-picker > summary {
+    padding-block: 8px;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+#ttds_language_summary { margin-inline-start: 6px; font-size: .9em; opacity: .8; }
+.ttds-language-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(6rem, 1fr));
+    gap: 2px 8px;
+    padding-bottom: 8px;
+}
+.ttds-panel .ttds-language-options .checkbox_label { min-height: 32px; margin: 0; }
 .ttds-panel .ttds-status { margin-top: 10px; padding: 9px 11px; border: 1px solid var(--SmartThemeBorderColor, #999); border-radius: 8px; overflow-wrap: anywhere; font-size: .9em; }
 .ttds-panel .ttds-status[data-kind="ok"] { border-color: #6b9f83; }
 .ttds-panel .ttds-status[data-kind="error"] { border-color: #ca7070; }
