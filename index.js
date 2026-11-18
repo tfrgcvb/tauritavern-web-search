@@ -1,10 +1,11 @@
 /*
  * TT DeepSeek Search - frontend SillyTavern / TauriTavern extension.
- * Manual-trigger web search; no MCP / no model tool call required.
+ * DeepSeek search and optional automatic routing for the current chat turn.
  * For personal use. Do not ship API keys inside this script.
  */
-import { setExtensionPrompt, extension_prompt_types, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, setExtensionPrompt, extension_prompt_types, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
+import { getCurrentUserHandle } from '../../../user.js';
 
 const EXT_NAME = 'tt-deepseek-search';
 const CONFIG_KEY = 'ttDeepSeekSearch';
@@ -25,9 +26,10 @@ const defaultConfig = Object.freeze({
     timeoutSeconds: 25,
 });
 
-let credentials = { directKey: '', relayToken: '' }; // RAM only: never saved to settings / chat history.
-let generationCache = new Map();
-let decisionCache = new Map();
+const credentials = { directKey: '', relayToken: '' };
+const generationCache = new Map();
+const decisionCache = new Map();
+let activeLookup = null;
 let activeTest = false;
 
 function options() {
@@ -71,8 +73,6 @@ function latestUserMessage(chat) {
     return '';
 }
 
-function currentQuery(chat) { return extractQuery(latestUserMessage(chat)); }
-
 function normalizedURL(input) {
     const raw = String(input || '').trim();
     let url;
@@ -95,8 +95,20 @@ function relayEndpoint(cfg, path) {
     return u.toString();
 }
 
+function deviceKeyName() {
+    return `${EXT_NAME}:direct-api-key:${getCurrentUserHandle()}`;
+}
+
+function readDeviceKey() {
+    try {
+        return window.localStorage.getItem(deviceKeyName()) || '';
+    } catch {
+        return '';
+    }
+}
+
 function activeToken(cfg) {
-    const token = cfg.mode === 'relay' ? credentials.relayToken : credentials.directKey;
+    const token = cfg.mode === 'relay' ? credentials.relayToken : credentials.directKey || readDeviceKey();
     if (!token) {
         throw new Error(cfg.mode === 'relay'
             ? '请先在扩展设置里填写中继访问口令。'
@@ -105,24 +117,39 @@ function activeToken(cfg) {
     return token.trim();
 }
 
-function errorFromHttp(status, data) {
+function errorFromHttp(status, data, token) {
     const msg = data?.error?.message || data?.message || '';
     if (status === 401) return '401：密钥或中继口令无效。';
     if (status === 402) return '402：DeepSeek 账户余额不足。';
     if (status === 403) return '403：访问被拒绝（中继口令或服务器策略）。';
     if (status === 429) return '429：搜索请求过于频繁。';
-    const suffix = String(msg).slice(0, 250);
+    const suffix = compact(String(msg).replaceAll(token, '[已隐藏]'), 250);
     return `HTTP ${status}${suffix ? `：${suffix}` : ''}`;
 }
 
-async function requestSearch(rawQuery, opts = options(), fetchImpl = fetch) {
+function timedRequest(cfg, signal) {
+    const timeoutMs = Math.min(60000, Math.max(5000, (Number(cfg.timeoutSeconds) || 25) * 1000));
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (signal?.aborted) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(abort, timeoutMs);
+    return {
+        signal: controller.signal,
+        timeoutMs,
+        dispose() {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', abort);
+        },
+    };
+}
+
+async function requestSearch(rawQuery, opts = options(), fetchImpl = fetch, signal) {
     const query = validateQuery(rawQuery);
     const endpoint = searchEndpoint(opts);
     const token = activeToken(opts);
     const count = Math.min(10, Math.max(1, Number(opts.count) || 5));
-    const timeoutMs = Math.min(60000, Math.max(5000, (Number(opts.timeoutSeconds) || 25) * 1000));
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const request = timedRequest(opts, signal);
     try {
         const response = await fetchImpl(endpoint, {
             method: 'POST',
@@ -131,36 +158,34 @@ async function requestSearch(rawQuery, opts = options(), fetchImpl = fetch) {
                 'Authorization': `Bearer ${token}`,
             },
             body: JSON.stringify({ query, count, need_content: false }),
-            signal: controller.signal,
+            signal: request.signal,
             credentials: 'omit',
         });
         let data;
         try { data = await response.json(); }
         catch { throw new Error(`搜索服务器返回了非 JSON 响应（HTTP ${response.status}）。`); }
-        if (!response.ok) throw new Error(errorFromHttp(response.status, data));
-        if (!Array.isArray(data.results)) throw new Error('搜索响应缺少 results 数组。');
+        if (!response.ok) throw new Error(errorFromHttp(response.status, data, token));
+        if (!Array.isArray(data?.results)) throw new Error('搜索响应缺少 results 数组。');
         return data.results;
     } catch (err) {
-        if (err?.name === 'AbortError') throw new Error(`搜索连接超时（${timeoutMs / 1000} 秒）。`);
+        if (err?.name === 'AbortError') throw new Error(`搜索连接超时（${request.timeoutMs / 1000} 秒）。`);
         if (opts.mode === 'direct' && err instanceof TypeError) {
             throw new Error('浏览器无法直连 DeepSeek，可能受到 CORS/网络限制。请使用 Cloudflare Worker 中继模式。');
         }
         throw err;
     } finally {
-        clearTimeout(timer);
+        request.dispose();
     }
 }
 
 // Cheap optional routing. This never invokes a Gemini tool. Only the latest
 // user message is sent to the routing model; no full RP transcript is uploaded.
-async function requestDecision(userMessage, cfg = options(), fetchImpl = fetch) {
+async function requestDecision(userMessage, cfg = options(), fetchImpl = fetch, signal) {
     const message = String(userMessage || '').trim().slice(0, 950);
     if (!message) return { need_search: false, query: '' };
     const url = cfg.mode === 'relay' ? relayEndpoint(cfg, 'decide') : DECISION_API;
     const token = activeToken(cfg);
-    const timeoutMs = Math.min(60000, Math.max(5000, (Number(cfg.timeoutSeconds) || 25) * 1000));
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const request = timedRequest(cfg, signal);
     try {
         const system = [
             '你是角色扮演聊天的联网检索路由器。只输出 JSON，不回答用户、不续写剧情。',
@@ -185,16 +210,19 @@ async function requestDecision(userMessage, cfg = options(), fetchImpl = fetch) 
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
             body: JSON.stringify(payload),
-            signal: controller.signal,
+            signal: request.signal,
             credentials: 'omit',
         });
         let data;
         try { data = await response.json(); }
         catch { throw new Error('DeepSeek 联网判断返回了非 JSON 结果。'); }
-        if (!response.ok) throw new Error(errorFromHttp(response.status, data));
-        if (data.error) throw new Error(String(data.error.message || data.error).slice(0, 160));
-        const decision = cfg.mode === 'relay' ? data : JSON.parse(String(data.choices?.[0]?.message?.content || '').trim());
-        if (decision?.need_search !== true) return { need_search: false, query: '' };
+        if (!response.ok) throw new Error(errorFromHttp(response.status, data, token));
+        if (data?.error) throw new Error(compact(String(data.error.message || data.error).replaceAll(token, '[已隐藏]'), 160));
+        let decision;
+        try { decision = cfg.mode === 'relay' ? data : JSON.parse(data?.choices?.[0]?.message?.content); }
+        catch { throw new Error('DeepSeek 联网判断返回了无效的 JSON。'); }
+        if (decision?.need_search === false) return { need_search: false, query: '' };
+        if (decision?.need_search !== true) throw new Error('DeepSeek 联网判断缺少有效的 need_search 字段。');
         return { need_search: true, query: validateQuery(decision.query) };
     } catch (err) {
         if (err?.name === 'AbortError') throw new Error('联网判断超时。');
@@ -203,17 +231,19 @@ async function requestDecision(userMessage, cfg = options(), fetchImpl = fetch) 
         }
         throw err;
     } finally {
-        clearTimeout(timer);
+        request.dispose();
     }
 }
 
-async function getDecision(message, cfg) {
+async function getDecision(message, cfg, signal) {
     const cacheKey = `${cfg.mode}|${searchEndpoint(cfg)}|${message.slice(0, 950)}`;
     const hit = decisionCache.get(cacheKey);
     if (hit && Date.now() - hit.when < CACHE_MS) return { ...hit.value, cached: true };
-    const value = await requestDecision(message, cfg);
-    decisionCache.set(cacheKey, { when: Date.now(), value });
-    if (decisionCache.size > 30) decisionCache.delete(decisionCache.keys().next().value);
+    const value = await requestDecision(message, cfg, fetch, signal);
+    if (!signal.aborted) {
+        decisionCache.set(cacheKey, { when: Date.now(), value });
+        if (decisionCache.size > 30) decisionCache.delete(decisionCache.keys().next().value);
+    }
     return { ...value, cached: false };
 }
 
@@ -221,7 +251,7 @@ function compact(raw, maximum) {
     return String(raw || '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ').trim().slice(0, maximum);
 }
 
-function evidenceForModel(query, results) {
+function formatEvidence(query, results) {
     const preface = [
         '[联网搜索参考资料 / DeepSeek Search]',
         `本轮搜索词：${query}`,
@@ -232,23 +262,24 @@ function evidenceForModel(query, results) {
         '',
     ];
     let used = preface.join('\n');
-    let added = 0;
+    const sources = [];
     for (const record of results) {
-        if (added >= 10 || used.length >= MAX_RESPONSE_CHARS - 240) break;
-        let url;
-        try {
-            const parsed = new URL(String(record?.url || ''));
-            if (!['https:', 'http:'].includes(parsed.protocol)) continue;
-            url = parsed.toString().slice(0, 600);
-        } catch { continue; }
+        if (sources.length >= 10 || used.length >= MAX_RESPONSE_CHARS - 240) break;
+        let parsed;
+        try { parsed = new URL(String(record?.url || '')); }
+        catch { continue; }
+        if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) continue;
+        const url = parsed.href;
         const title = compact(record?.title || '无标题', 160);
-        const summary = compact(record?.summary || record?.snippet || '', 750);
         const date = compact(record?.date || '', 40);
-        const block = `[${added + 1}] ${title}\n来源：${url}${date ? `\n日期：${date}` : ''}\n摘要：${summary}\n\n`;
-        used += block.slice(0, Math.max(0, MAX_RESPONSE_CHARS - used.length));
-        added += 1;
+        const header = `[${sources.length + 1}] ${title}\n来源：${url}${date ? `\n日期：${date}` : ''}\n摘要：`;
+        const remaining = MAX_RESPONSE_CHARS - used.length - header.length - 2;
+        if (remaining < 0) continue;
+        const summary = compact(record?.summary || record?.snippet || '', Math.min(750, remaining));
+        used += `${header}${summary}\n\n`;
+        sources.push({ title, url, host: parsed.hostname, date, summary });
     }
-    return `${used}\n[/联网搜索参考资料]`;
+    return { prompt: `${used}\n[/联网搜索参考资料]`, sources };
 }
 
 function emptyPrompt() {
@@ -262,23 +293,37 @@ function injectPrompt(value) {
 function status(message, kind = 'info') {
     const node = document.getElementById('ttds_status');
     if (node) {
+        node.hidden = false;
         node.textContent = String(message);
         node.dataset.kind = kind;
     }
     if (kind === 'error') console.warn('[TT DeepSeek Search]', message);
 }
 
-async function getResults(query, cfg) {
+async function getResults(query, cfg, signal) {
     const cacheKey = `${cfg.mode}|${searchEndpoint(cfg)}|${cfg.count}|${query}`;
     const hit = generationCache.get(cacheKey);
     if (hit && Date.now() - hit.when < CACHE_MS) return { results: hit.results, cached: true };
-    const results = await requestSearch(query, cfg);
-    generationCache.set(cacheKey, { when: Date.now(), results });
-    if (generationCache.size > 15) {
-        const earliestKey = generationCache.keys().next().value;
-        generationCache.delete(earliestKey);
+    const results = await requestSearch(query, cfg, fetch, signal);
+    if (!signal.aborted) {
+        generationCache.set(cacheKey, { when: Date.now(), results });
+        if (generationCache.size > 15) generationCache.delete(generationCache.keys().next().value);
     }
     return { results, cached: false };
+}
+
+function cancelLookup() {
+    activeLookup?.abort();
+    activeLookup = null;
+}
+
+function resetActivity() {
+    cancelLookup();
+    const panel = document.getElementById('ttds_activity');
+    if (!panel) return;
+    panel.open = false;
+    panel.hidden = !options().enabled;
+    showActivity('暂无联网记录', { detail: '发送消息后查看本轮联网情况。' });
 }
 
 // Stable SillyTavern-compatible generation interceptor. It does not modify chat[]
@@ -286,47 +331,138 @@ async function getResults(query, cfg) {
 globalThis.ttDeepSeekSearchInterceptor = async function (chat, _contextSize, _abort, type) {
     emptyPrompt(); // no stale results on non-search turns
     const cfg = options();
-    if (!cfg.enabled || !['normal', 'regenerate', 'swipe'].includes(type)) return;
-    let query;
-    try { query = currentQuery(chat); }
-    catch (err) {
-        status(err.message || '搜索词格式错误。', 'error');
-        injectPrompt('[联网搜索结果] 搜索词无效，未联网成功。请不要宣称查询了最新网页。');
+    if (!cfg.enabled || !['normal', 'regenerate', 'swipe'].includes(type)) {
+        if (activeLookup) resetActivity();
         return;
     }
-    if (!query && cfg.triggerMode === 'automatic') {
-        const message = latestUserMessage(chat);
-        if (!message.trim()) return;
-        try {
-            status('DeepSeek 正在判断是否需要联网……');
-            const decision = await getDecision(message, cfg);
-            if (!decision.need_search) {
-                status(`本轮无需联网${decision.cached ? '（缓存判断）' : ''}，直接交给 Gemini。`, 'ok');
-                return;
-            }
-            query = decision.query;
-        } catch (err) {
-            status(`自动判断失败，本轮跳过搜索：${compact(err?.message || err, 200)}`, 'error');
-            return; // Never block ordinary chat due to routing failure.
-        }
-    }
-    if (!query) return;
+    cancelLookup();
+    const lookup = new AbortController();
+    const { signal } = lookup;
+    activeLookup = lookup;
+
+    const userMessage = latestUserMessage(chat);
+    let stage = 'query';
+    let decision = '';
+    let query;
     try {
-        status(`正在搜索：${query}`);
-        const { results, cached } = await getResults(query, cfg);
-        if (!results.length) {
-            injectPrompt(`[联网搜索结果] 已搜索「${query}」，但没有找到结果。不能把常识当作最新搜索事实。`);
-            status('搜索完成，但没有结果。');
+        if (!userMessage.trim()) {
+            resetActivity();
             return;
         }
-        injectPrompt(evidenceForModel(query, results));
-        status(`搜索完成：${results.length} 条${cached ? '（10分钟内缓存）' : ''}，已交给 Gemini。`, 'ok');
+        query = extractQuery(userMessage);
+        if (query) {
+            decision = '手动指定搜索';
+        } else if (cfg.triggerMode === 'automatic') {
+            stage = 'decision';
+            showActivity('正在判断', { detail: 'DeepSeek Flash 正在判断是否需要联网。', kind: 'pending' });
+            const result = await getDecision(userMessage, cfg, signal);
+            if (signal.aborted) return;
+            const cachedDecision = result.cached ? '（缓存）' : '';
+            if (!result.need_search) {
+                showActivity('无需联网', { decision: `DeepSeek Flash 判定无需联网${cachedDecision}`, kind: 'ok' });
+                return;
+            }
+            decision = `DeepSeek Flash 判定需要联网${cachedDecision}`;
+            query = result.query;
+        } else {
+            showActivity('未触发搜索', { detail: '手动模式使用 [[搜:关键词]] 发起搜索。' });
+            return;
+        }
+        stage = 'search';
+        showActivity('正在搜索', { decision, query, kind: 'pending' });
+        const { results, cached } = await getResults(query, cfg, signal);
+        if (signal.aborted) return;
+        const { prompt, sources } = formatEvidence(query, results);
+        const detail = cached ? '本轮使用缓存的搜索结果。' : '';
+        if (!sources.length) {
+            injectPrompt(`[联网搜索结果] 已搜索「${query}」，但没有找到结果。不能把常识当作最新搜索事实。`);
+            showActivity('没有可用来源', { decision, query, detail });
+            return;
+        }
+        injectPrompt(prompt);
+        showActivity(`找到 ${sources.length} 条来源`, { decision, query, detail, sources, kind: 'ok' });
     } catch (err) {
-        const message = compact(err?.message || err, 280);
-        injectPrompt(`[联网搜索结果] 本轮搜索「${query}」失败：${message}。请说明搜索失败，不要假装已经查到网页。`);
-        status(message, 'error');
+        if (signal.aborted) return;
+        const detail = compact(err?.message || err, 280);
+        if (stage === 'query') {
+            injectPrompt('[联网搜索结果] 搜索词无效，未联网成功。请不要宣称查询了最新网页。');
+            showActivity('搜索词无效', { detail, kind: 'error' });
+        } else if (stage === 'decision') {
+            showActivity('联网判断失败', { detail, kind: 'error' });
+        } else {
+            injectPrompt(`[联网搜索结果] 本轮搜索「${query}」失败：${detail}。请说明搜索失败，不要假装已经查到网页。`);
+            showActivity('搜索失败', { decision, query, detail, kind: 'error' });
+        }
+    } finally {
+        if (activeLookup === lookup) activeLookup = null;
     }
 };
+
+function createSource({ title, url, host, date, summary }) {
+    const item = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = title;
+    const meta = document.createElement('small');
+    meta.textContent = date ? `${host} · ${date}` : host;
+    item.append(link, meta);
+    if (summary) {
+        const snippet = document.createElement('p');
+        snippet.textContent = summary;
+        item.append(snippet);
+    }
+    return item;
+}
+
+function showActivity(label, { decision = '', query = '', detail = '', sources = [], kind = 'info' } = {}) {
+    const activity = document.getElementById('ttds_activity');
+    if (!activity) return;
+
+    activity.dataset.kind = kind;
+    activity.querySelector('.ttds-activity-state').textContent = label;
+    for (const [field, value] of Object.entries({ decision, query })) {
+        const row = activity.querySelector(`[data-ttds-field="${field}"]`);
+        row.hidden = !value;
+        row.querySelector('dd').textContent = value;
+    }
+    const note = activity.querySelector('.ttds-activity-note');
+    note.hidden = !detail;
+    note.textContent = detail;
+    const list = activity.querySelector('.ttds-activity-sources');
+    list.hidden = !sources.length;
+    list.replaceChildren(...sources.map(createSource));
+}
+
+function mountActivity(fallback) {
+    const html = `
+<details class="ttds-activity" id="ttds_activity">
+  <summary><span class="ttds-activity-name">DeepSeek 联网</span><span class="ttds-activity-state" role="status" aria-live="polite"></span></summary>
+  <div class="ttds-activity-body">
+    <dl class="ttds-activity-meta">
+      <div data-ttds-field="decision" hidden><dt>判断</dt><dd></dd></div>
+      <div data-ttds-field="query" hidden><dt>搜索词</dt><dd></dd></div>
+    </dl>
+    <p class="ttds-activity-note" hidden></p>
+    <ol class="ttds-activity-sources" aria-label="供本轮回复参考的网页来源" hidden></ol>
+  </div>
+</details>`;
+    const composer = document.getElementById('send_form');
+    if (composer) composer.insertAdjacentHTML('beforebegin', html);
+    else fallback.insertAdjacentHTML('afterbegin', html);
+    resetActivity();
+
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        emptyPrompt();
+        resetActivity();
+    });
+    eventSource.on(event_types.GENERATION_STOPPED, () => {
+        if (!activeLookup) return;
+        cancelLookup();
+        showActivity('联网检查已停止');
+    });
+}
 
 function createUI() {
     const html = `
@@ -338,14 +474,20 @@ function createUI() {
     <select id="ttds_trigger" class="text_pole"><option value="manual">手动：仅搜索标记触发（不收判断费）</option><option value="automatic">自动：DeepSeek Flash 判断是否联网</option></select>
     <label for="ttds_mode">请求方式</label>
     <select id="ttds_mode" class="text_pole"><option value="direct">直连 DeepSeek（若 CORS 允许）</option><option value="relay">Cloudflare Worker 中继（推荐安卓，需部署新版 Worker）</option></select>
-    <div id="ttds_direct_box"><label for="ttds_direct_key">DeepSeek 官方 API Key（仅本次运行，绝不存盘）</label><input id="ttds_direct_key" class="text_pole" type="password" autocomplete="off" placeholder="sk-..." /></div>
+    <div id="ttds_direct_box">
+      <label for="ttds_direct_key">DeepSeek 官方 API Key</label>
+      <div class="ttds-key-row">
+        <input id="ttds_direct_key" class="text_pole" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-..." />
+        <button class="menu_button" id="ttds_remember_key" type="button" disabled>在此设备保存</button>
+      </div>
+      <p class="ttds-help">输入后可在本次会话使用。点击保存后，Key 会以明文留在当前设备的本地存储中。</p>
+    </div>
     <div id="ttds_relay_box" hidden><label for="ttds_relay_url">中继地址</label><input id="ttds_relay_url" class="text_pole" type="url" placeholder="https://your-worker.workers.dev/search"/><label for="ttds_relay_token">中继访问口令（仅本次运行）</label><input id="ttds_relay_token" class="text_pole" type="password" autocomplete="off" placeholder="在 Worker 中自行设置的口令"/></div>
     <label for="ttds_count">每次结果条数（1～10）</label><input id="ttds_count" class="text_pole" type="number" min="1" max="10" />
     <label for="ttds_timeout">超时秒数（5～60）</label><input id="ttds_timeout" class="text_pole" type="number" min="5" max="60" />
-    <div class="ttds-actions"><button class="menu_button" id="ttds_test" type="button">测试搜索</button><button class="menu_button" id="ttds_test_router" type="button">测试自动判断</button><button class="menu_button" id="ttds_clear" type="button">清除会话密钥</button></div>
-    <p class="ttds-help">自动模式下，每一条非显式搜索的用户消息会先由 DeepSeek Flash 做一次简短判断；必要时调用 DeepSeek Search。手动模式仅响应 <code>[[搜:关键词]]</code>，不产生判断费用。两种模式均不会让 Gemini 进行工具调用。</p>
-    <p class="ttds-help">密钥仅保存在当前页面内存；刷新或重启后请重新填写。直连遭遇跨域错误时，请选中继模式并阅读随附 README。</p>
-    <div id="ttds_status" class="ttds-status" aria-live="polite">等待搜索</div>
+    <div class="ttds-actions"><button class="menu_button" id="ttds_test" type="button">测试搜索</button><button class="menu_button" id="ttds_test_router" type="button">测试自动判断</button><button class="menu_button" id="ttds_clear" type="button">清除密钥和中继口令</button></div>
+    <p class="ttds-help">自动模式由 DeepSeek Flash 判断是否需要联网。任一模式都可以用 <code>[[搜:关键词]]</code> 直接触发搜索。</p>
+    <div id="ttds_status" class="ttds-status" aria-live="polite" hidden></div>
   </div>
 </section>`;
     const target = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings');
@@ -360,6 +502,13 @@ function createUI() {
     $id('ttds_relay_url').value = cfg.relayUrl;
     $id('ttds_count').value = String(cfg.count);
     $id('ttds_timeout').value = String(cfg.timeoutSeconds);
+    const directKey = $id('ttds_direct_key');
+    const rememberKey = $id('ttds_remember_key');
+    function refreshDeviceKeyControl() {
+        directKey.placeholder = readDeviceKey() ? '已保存在此设备' : 'sk-...';
+        rememberKey.disabled = !credentials.directKey;
+    }
+    refreshDeviceKeyControl();
     const switchMode = () => {
         const direct = $id('ttds_mode').value === 'direct';
         $id('ttds_direct_box').hidden = !direct;
@@ -370,6 +519,8 @@ function createUI() {
         options()[key] = value;
         generationCache.clear();
         decisionCache.clear();
+        if (activeLookup || key === 'enabled') resetActivity();
+        if (key === 'enabled' && !value) emptyPrompt();
         saveSettingsDebounced();
     }
     $id('ttds_enabled').addEventListener('change', e => save('enabled', !!e.target.checked));
@@ -378,15 +529,46 @@ function createUI() {
     $id('ttds_relay_url').addEventListener('change', e => save('relayUrl', e.target.value.trim()));
     $id('ttds_count').addEventListener('change', e => save('count', Math.min(10, Math.max(1, Number(e.target.value) || 5))));
     $id('ttds_timeout').addEventListener('change', e => save('timeoutSeconds', Math.min(60, Math.max(5, Number(e.target.value) || 25))));
-    $id('ttds_direct_key').addEventListener('input', e => { credentials.directKey = e.target.value.trim(); generationCache.clear(); decisionCache.clear(); });
-    $id('ttds_relay_token').addEventListener('input', e => { credentials.relayToken = e.target.value.trim(); generationCache.clear(); decisionCache.clear(); });
-    $id('ttds_clear').addEventListener('click', () => {
-        credentials = { directKey: '', relayToken: '' };
+    function credentialsChanged() {
         generationCache.clear();
         decisionCache.clear();
-        $id('ttds_direct_key').value = '';
+        if (activeLookup) resetActivity();
+    }
+    directKey.addEventListener('input', () => {
+        credentials.directKey = directKey.value.trim();
+        credentialsChanged();
+        refreshDeviceKeyControl();
+    });
+    rememberKey.addEventListener('click', () => {
+        if (!credentials.directKey) return;
+        try {
+            window.localStorage.setItem(deviceKeyName(), credentials.directKey);
+        } catch {
+            status('当前设备无法保存 Key。本次会话仍可使用。', 'error');
+            return;
+        }
+        credentials.directKey = '';
+        directKey.value = '';
+        refreshDeviceKeyControl();
+        status('API Key 已保存在此设备。', 'ok');
+    });
+    $id('ttds_relay_token').addEventListener('input', e => {
+        credentials.relayToken = e.target.value.trim();
+        credentialsChanged();
+    });
+    $id('ttds_clear').addEventListener('click', () => {
+        credentials.directKey = '';
+        credentials.relayToken = '';
+        credentialsChanged();
+        directKey.value = '';
         $id('ttds_relay_token').value = '';
-        status('已清除当前页面内存中的密钥。', 'ok');
+        try {
+            window.localStorage.removeItem(deviceKeyName());
+            status('已清除密钥和中继口令。', 'ok');
+        } catch {
+            status('已清除会话凭据。当前设备的本地存储无法访问。', 'error');
+        }
+        refreshDeviceKeyControl();
     });
     $id('ttds_test_router').addEventListener('click', async () => {
         if (activeTest) return;
@@ -418,6 +600,7 @@ function createUI() {
             $id('ttds_test').disabled = false;
         }
     });
+    mountActivity($id('ttds_panel').querySelector('.inline-drawer-content'));
 }
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
